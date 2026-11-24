@@ -28,7 +28,8 @@ runs:
         if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
           # triggered by a tag push (e.g: refs/tags/companion-v1.2.3)
           GIT_TAG_NAME="${GITHUB_REF#refs/tags/}"
-          VERSION_STRING="${GIT_TAG_NAME##*-}"
+          # everything after the firmware-type prefix, so "room-server-v1.18.0-mr1" -> "v1.18.0-mr1"
+          VERSION_STRING="v${GIT_TAG_NAME#*-v}"
         else
           # triggered by a workflow dispatch (e.g: refs/heads/main)
           # strip "refs/heads/" prefix and replace any remaining "/" with "-" to protect file paths

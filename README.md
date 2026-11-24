@@ -16,6 +16,11 @@
 
 Full description (in Czech): [SUBROOMS.md](SUBROOMS.md).
 
+### Prebuilt firmware
+Ready-to-flash builds for all room server targets are in [Releases](https://github.com/pmalecek/meshcore-room-server-extended-multiroom/releases)
+(ESP32 boards: `*-merged.bin` for a fresh install at offset 0x0, `*.bin` for an update; nRF52 boards: `*.uf2` / `*.zip`).
+Flash them the same way as official MeshCore firmware. Settings, identity and admin clients are kept when updating.
+
 ### Build & flash (Heltec V3)
 ```
 pio run -e Heltec_v3_room_server -t upload
