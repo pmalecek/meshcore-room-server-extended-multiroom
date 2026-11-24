@@ -1,3 +1,31 @@
+# MeshCore – Room Server Extended (multi-room)
+
+> **This is a fork of [MeshCore](https://github.com/meshcore-dev/MeshCore)** (based on v1.18.0, commit `75b04ef`).
+> It extends the **room server** firmware so that one node works as a hub with up to **4 sub-rooms**.
+> Everything else is unchanged upstream MeshCore. Companion firmware and apps need no changes.
+
+### What's new
+- One room server hosts up to 4 sub-rooms: room `0` is the default (lobby), rooms `1–3` are optional.
+- Users switch rooms with chat commands: `/rooms`, `/join <no|name>`, `/exit`, `/where`, `/help`.
+- New clients land in the default room and get a configurable welcome message.
+- The server keeps per-room sync state for every client, so switching rooms loses no messages.
+- Pushed posts can be prefixed with `[room name]` (`room.prefix on|off`).
+- Admin CLI for room management: `room.list`, `room.add`, `room.del`, `room.rename`, `room.clear`, `room.welcome`, `room.post [@room]`, `room.wake`, `room.last`.
+- Unsynced post buffer raised to 64 (`MAX_UNSYNCED_POSTS`).
+- OLED UI (tested on Heltec V3): overview, per-room activity and radio screens, cycled with the PRG button; the display wakes on new posts.
+
+Full description (in Czech): [SUBROOMS.md](SUBROOMS.md).
+
+### Build & flash (Heltec V3)
+```
+pio run -e Heltec_v3_room_server -t upload
+```
+Other room server targets (`*_room_server` environments) should work too, but only Heltec V3 has been tested.
+
+Changed files: `examples/simple_room_server/*`, `src/helpers/ClientACL.h`.
+
+---
+
 ## About MeshCore
 
 MeshCore is a lightweight, portable C++ library that enables multi-hop packet routing for embedded projects using LoRa and other packet radios. It is designed for developers who want to create resilient, decentralized communication networks that work without the internet.

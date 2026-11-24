@@ -39,21 +39,22 @@ struct ServerStats {
 };
 
 void MyMesh::addPost(ClientInfo *client, const char *postData) {
-  storePost(client->id, postData);
+  storePost(client->id, postData, client->extra.room.current_room);
 }
 
-void MyMesh::addSystemPost(const char *postData) {
+void MyMesh::addSystemPost(const char *postData, uint8_t room_id) {
   if (!postData || postData[0] == 0) return;
 
   MESH_DEBUG_PRINTLN("room.post: addSystemPost: %s", postData);
 
-  storePost(self_id, postData);
+  storePost(self_id, postData, room_id);
 }
 
-void MyMesh::storePost(const mesh::Identity &author, const char *postData) {
+void MyMesh::storePost(const mesh::Identity &author, const char *postData, uint8_t room_id) {
   int idx = next_post_idx;
   // TODO: suggested postData format: <title>/<descrption>
   posts[idx].author = author; // add to cyclic queue
+  posts[idx].room_id = room_id;
   StrHelper::strncpy(posts[idx].text, postData, MAX_POST_TEXT_LEN);
 
   posts[idx].post_timestamp = getRTCClock()->getCurrentTimeUnique();
@@ -80,13 +81,20 @@ void MyMesh::pushPostToClient(ClientInfo *client, PostInfo &post) {
   memcpy(&reply_data[len], post.author.pub_key, 4);
   len += 4; // just first 4 bytes
 
-  int text_len = strlen(post.text);
-  memcpy(&reply_data[len], post.text, text_len);
+  const char* text = post.text;
+  char prefixed[MAX_POST_TEXT_LEN+1];
+  if ((rooms.flags & SUBROOM_FLAG_PREFIX) && post.room_id < MAX_SUBROOMS && hasOptionalRooms()) {
+    snprintf(prefixed, sizeof(prefixed), "[%s] %s", rooms.names[post.room_id], post.text);
+    text = prefixed;
+  }
+  int text_len = strlen(text);
+  memcpy(&reply_data[len], text, text_len);
   len += text_len;
 
   // calc expected ACK reply
   mesh::Utils::sha256((uint8_t *)&client->extra.room.pending_ack, 4, reply_data, len, client->id.pub_key, PUB_KEY_SIZE);
   client->extra.room.push_post_timestamp = post.post_timestamp;
+  client->extra.room.push_room = client->extra.room.current_room;   // ACK advances sync of THIS sub-room
 
   auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, client->shared_secret, reply_data, len);
   if (reply) {
@@ -107,11 +115,18 @@ void MyMesh::pushPostToClient(ClientInfo *client, PostInfo &post) {
   }
 }
 
+bool MyMesh::isPostForClient(const PostInfo& post, const ClientInfo* client) const {
+  uint8_t r = client->extra.room.current_room;
+  if (r >= MAX_SUBROOMS) r = 0;
+  return post.post_timestamp > client->extra.room.sync_since[r]        // is new post for this Client (in its sub-room)?
+      && (post.room_id == r || post.room_id == SUBROOM_ALL)          // posted to the Client's sub-room?
+      && !post.author.matches(client->id);                            // don't push posts to the author
+}
+
 uint8_t MyMesh::getUnsyncedCount(ClientInfo *client) {
   uint8_t count = 0;
   for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
-    if (posts[k].post_timestamp > client->extra.room.sync_since // is new post for this Client?
-        && !posts[k].author.matches(client->id)) {   // don't push posts to the author
+    if (isPostForClient(posts[k], client)) {
       count++;
     }
   }
@@ -124,7 +139,8 @@ bool MyMesh::processAck(const uint8_t *data) {
     if (client->extra.room.pending_ack && memcmp(data, &client->extra.room.pending_ack, 4) == 0) { // got an ACK from Client!
       client->extra.room.pending_ack = 0; // clear this, so next push can happen
       client->extra.room.push_failures = 0;
-      client->extra.room.sync_since = client->extra.room.push_post_timestamp; // advance Client's SINCE timestamp, to sync next post
+      uint8_t r = client->extra.room.push_room < MAX_SUBROOMS ? client->extra.room.push_room : 0;
+      client->extra.room.sync_since[r] = client->extra.room.push_post_timestamp; // advance Client's SINCE timestamp (of that sub-room), to sync next post
       return true;
     }
   }
@@ -355,6 +371,7 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
         }
       }
 
+      bool is_new = acl.getClient(sender.pub_key, PUB_KEY_SIZE) == NULL;
       client = acl.putClient(sender, 0);  // add to known clients (if not already known)
       if (sender_timestamp <= client->last_timestamp) {
         MESH_DEBUG_PRINTLN("possible replay attack!");
@@ -363,7 +380,21 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
 
       MESH_DEBUG_PRINTLN("Login success!");
       client->last_timestamp = sender_timestamp;
-      client->extra.room.sync_since = sender_sync_since;
+      // NOTE: the companion keeps ONE 'sync since' (newest post received from ANY sub-room),
+      //       so the per-room state is kept here, on the server. The client's value is only
+      //       used to lower it (e.g. companion was reset and wants the history again).
+      for (int r = 0; r < MAX_SUBROOMS; r++) {
+        if (is_new || sender_sync_since < client->extra.room.sync_since[r]) {
+          client->extra.room.sync_since[r] = sender_sync_since;
+        }
+      }
+      if (is_new) {
+        client->extra.room.current_room = 0;                       // newcomers go to the default sub-room
+        client->extra.room.flags |= ROOM_FLAG_NEED_WELCOME;
+      } else {
+        if (!isRoomActive(client->extra.room.current_room)) client->extra.room.current_room = 0;
+        if (client->extra.room.current_room != 0) client->extra.room.flags |= ROOM_FLAG_NEED_WHERE;   // remind where they are
+      }
       client->extra.room.pending_ack = 0;
       client->extra.room.push_failures = 0;
 
@@ -462,6 +493,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
                           PUB_KEY_SIZE);
 
       uint8_t temp[166];
+      int prefix_len = 0;   // 4 = reply is TXT_TYPE_SIGNED_PLAIN, with author prefix at temp[5]
       bool send_ack;
       if (flags == TXT_TYPE_CLI_DATA || flags == TXT_TYPE_CLI_COMMAND) {
         if (client->isAdmin()) {
@@ -476,6 +508,13 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
           temp[5] = 0;      // no reply
           send_ack = false; // and no ACK...  user shoudn't be sending these
         }
+      } else if (findUserCommand((const char *)&data[5]) != NULL) { // TXT_TYPE_PLAIN, sub-room command (allowed for guests too)
+        // reply as a 'signed' post by the server itself (same as system posts), so apps show it in the room chat
+        handleUserCommand(client, findUserCommand((const char *)&data[5]), (char *)&temp[9]);
+        temp[4] = (TXT_TYPE_SIGNED_PLAIN << 2);
+        memcpy(&temp[5], self_id.pub_key, 4);
+        prefix_len = 4;
+        send_ack = true;
       } else { // TXT_TYPE_PLAIN
         if ((client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) {
           temp[5] = 0;      // no reply
@@ -511,7 +550,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
         delay_millis = 0;
       }
 
-      int text_len = strlen((char *)&temp[5]);
+      int text_len = strlen((char *)&temp[5 + prefix_len]);
       if (text_len > 0) {
         if (now == sender_timestamp) {
           // WORKAROUND: the two timestamps need to be different, in the CLI view
@@ -523,7 +562,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
         // mesh::Utils::sha256((uint8_t *)&expected_ack_crc, 4, temp, 5 + text_len, self_id.pub_key,
         // PUB_KEY_SIZE);
 
-        auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + text_len);
+        auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + prefix_len + text_len);
         if (reply) {
           if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(reply, delay_millis + SERVER_RESPONSE_DELAY, packet->getPathHashSize());
@@ -555,7 +594,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
           memcpy(&data[5], &forceSince, 4); // make sure there are zeroes in payload (for ack_hash calc below)
         }
         if (forceSince > 0) {
-          client->extra.room.sync_since = forceSince; // force-update the 'sync since'
+          applyForceSince(client, forceSince); // force-update the 'sync since' (of current sub-room, if valid)
         }
 
         client->extra.room.pending_ack = 0;
@@ -690,6 +729,11 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(posts, 0, sizeof(posts));
   _num_posted = _num_post_pushes = 0;
 
+  memset(&rooms, 0, sizeof(rooms));
+  StrHelper::strncpy(rooms.names[0], SUBROOM_DEFAULT_NAME, sizeof(rooms.names[0]));
+  StrHelper::strncpy(rooms.welcome, SUBROOM_DEFAULT_WELCOME, sizeof(rooms.welcome));
+  rooms.flags = SUBROOM_FLAG_PREFIX | SUBROOM_FLAG_DISP_WAKE;
+
   memset(default_scope.key, 0, sizeof(default_scope.key));
 }
 
@@ -701,6 +745,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
   acl.load(_fs, self_id);
   region_map.load(_fs);
+  loadRooms();
 
   // establish default-scope
   {
@@ -974,15 +1019,8 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       Serial.printf("\n");
     }
     reply[0] = 0;
-  } else if (strncmp(command, "room.post", 9) == 0) {
-    char* msg = command + 9;
-    while (*msg == ' ') msg++;
-    if (*msg == 0) {
-      snprintf(reply, MAX_POST_TEXT_LEN, "ERR empty message");
-    } else {
-      addSystemPost(msg);
-      snprintf(reply, MAX_POST_TEXT_LEN, "OK");
-    }
+  } else if (strncmp(command, "room.", 5) == 0 && handleRoomCommand(command, reply)) {
+    // sub-room admin commands (incl. room.post)
   } else if (memcmp(command, "set repeat on", 13) == 0) {
     strcpy(reply, "ERR - repeat now deprecated");
   } else{
@@ -1010,15 +1048,25 @@ void MyMesh::loop() {
     // check next Round-Robin client, and sync next new post
     auto client = acl.getClientByIdx(next_client_idx);
     bool did_push = false;
-    if (client->extra.room.pending_ack == 0 && client->last_activity != 0 &&
+    if ((client->extra.room.flags & (ROOM_FLAG_NEED_WELCOME | ROOM_FLAG_NEED_WHERE)) && client->last_activity != 0) {
+      // pending sub-room notice (welcome / 'you are in room X'), sent as plain text (doesn't touch sync state)
+      char msg[MAX_POST_TEXT_LEN+1];
+      if (client->extra.room.flags & ROOM_FLAG_NEED_WELCOME) {
+        expandWelcome(client, msg, sizeof(msg));
+      } else {
+        snprintf(msg, sizeof(msg), SUBROOM_TXT_WHERE, rooms.names[client->extra.room.current_room]);
+      }
+      client->extra.room.flags &= ~(ROOM_FLAG_NEED_WELCOME | ROOM_FLAG_NEED_WHERE);
+      sendNotice(client, msg);
+      did_push = true;
+    } else if (client->extra.room.pending_ack == 0 && client->last_activity != 0 &&
         client->extra.room.push_failures < 3) { // not already waiting for ACK, AND not evicted, AND retries not max
       MESH_DEBUG_PRINTLN("loop - checking for client %02X", (uint32_t)client->id.pub_key[0]);
       uint32_t now = getRTCClock()->getCurrentTime();
       for (int k = 0, idx = next_post_idx; k < MAX_UNSYNCED_POSTS; k++) {
         auto p = &posts[idx];
         if (now >= p->post_timestamp + POST_SYNC_DELAY_SECS &&
-            p->post_timestamp > client->extra.room.sync_since // is new post for this Client?
-            && !p->author.matches(client->id)) {   // don't push posts to the author
+            isPostForClient(*p, client)) {   // new post, in Client's sub-room, not by the Client
           // push this post to Client, then wait for ACK
           pushPostToClient(client, *p);
           did_push = true;
@@ -1078,4 +1126,445 @@ void MyMesh::loop() {
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
+}
+
+/* ------------------------------ Sub-rooms ------------------------------ */
+
+#define SUBROOMS_FILE_MAGIC   0x52   // 'R'
+#define SUBROOMS_FILE_VER     1
+#define REPLY_MAX             (MAX_POST_TEXT_LEN+1)
+
+static bool strEqNoCase(const char* a, const char* b) {
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+    a++; b++;
+  }
+  return *a == 0 && *b == 0;
+}
+
+// copy next space-delimited token from 'src' into 'dest', returns pointer to the rest (spaces skipped)
+static const char* nextToken(const char* src, char* dest, int dest_size) {
+  while (*src == ' ') src++;
+  int n = 0;
+  while (*src && *src != ' ') {
+    if (n < dest_size - 1) dest[n++] = *src;
+    src++;
+  }
+  dest[n] = 0;
+  while (*src == ' ') src++;
+  return src;
+}
+
+static bool isValidRoomName(const char* name) {
+  int len = strlen(name);
+  if (len < 1 || len > SUBROOM_NAME_LEN) return false;
+  if (len == 1 && name[0] >= '0' && name[0] <= '9') return false;   // single digits are reserved for room numbers
+  for (int i = 0; i < len; i++) {
+    if ((unsigned char)name[i] <= ' ' || name[i] == '[' || name[i] == ']') return false;
+  }
+  return true;
+}
+
+void MyMesh::loadRooms() {
+  if (!_fs->exists(SUBROOMS_FILE)) return;   // keep defaults
+#if defined(RP2040_PLATFORM)
+  File file = _fs->open(SUBROOMS_FILE, "r");
+#else
+  File file = _fs->open(SUBROOMS_FILE);
+#endif
+  if (!file) return;
+
+  uint8_t hdr[3];
+  SubRoomConfig tmp;
+  bool ok = file.read(hdr, 3) == 3
+         && hdr[0] == SUBROOMS_FILE_MAGIC && hdr[1] == SUBROOMS_FILE_VER && hdr[2] == MAX_SUBROOMS
+         && file.read((uint8_t *)&tmp, sizeof(tmp)) == sizeof(tmp);
+  file.close();
+
+  if (ok) {
+    for (int i = 0; i < MAX_SUBROOMS; i++) tmp.names[i][SUBROOM_NAME_LEN] = 0;   // sanitise
+    tmp.welcome[SUBROOM_WELCOME_LEN] = 0;
+    if (tmp.names[0][0] == 0) StrHelper::strncpy(tmp.names[0], SUBROOM_DEFAULT_NAME, sizeof(tmp.names[0]));
+    rooms = tmp;
+  } else {
+    MESH_DEBUG_PRINTLN("loadRooms: invalid %s, using defaults", SUBROOMS_FILE);
+  }
+}
+
+void MyMesh::saveRooms() {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(SUBROOMS_FILE);
+  File file = _fs->open(SUBROOMS_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File file = _fs->open(SUBROOMS_FILE, "w");
+#else
+  File file = _fs->open(SUBROOMS_FILE, "w", true);
+#endif
+  if (file) {
+    uint8_t hdr[3] = { SUBROOMS_FILE_MAGIC, SUBROOMS_FILE_VER, MAX_SUBROOMS };
+    file.write(hdr, 3);
+    file.write((const uint8_t *)&rooms, sizeof(rooms));
+    file.close();
+  }
+}
+
+bool MyMesh::hasOptionalRooms() const {
+  for (int i = 1; i < MAX_SUBROOMS; i++) {
+    if (rooms.names[i][0]) return true;
+  }
+  return false;
+}
+
+int MyMesh::findRoom(const char* key) const {
+  char k[SUBROOM_NAME_LEN+1];
+  nextToken(key, k, sizeof(k));
+  if (k[0] == 0) return -1;
+
+  if (k[1] == 0 && k[0] >= '0' && k[0] <= '9') {   // by number
+    int idx = k[0] - '0';
+    return isRoomActive(idx) ? idx : -1;
+  }
+  for (int i = 0; i < MAX_SUBROOMS; i++) {          // by name (case insensitive)
+    if (isRoomActive(i) && strEqNoCase(rooms.names[i], k)) return i;
+  }
+  return -1;
+}
+
+// "0=Lobby*, 1=Tesla, 2=Opravy"   ('*' marks 'mark_room', -1 = none)
+int MyMesh::formatRoomList(char* out, int max_len, int mark_room) const {
+  int len = 0;
+  out[0] = 0;
+  for (int i = 0; i < MAX_SUBROOMS; i++) {
+    if (!isRoomActive(i)) continue;
+    int n = snprintf(&out[len], max_len - len, "%s%d=%s%s", len ? ", " : "", i, rooms.names[i], i == mark_room ? "*" : "");
+    if (n < 0 || n >= max_len - len) { len = max_len - 1; break; }   // truncated
+    len += n;
+  }
+  return len;
+}
+
+void MyMesh::expandWelcome(const ClientInfo* client, char* out, int max_len) const {
+  uint8_t cur = client->extra.room.current_room < MAX_SUBROOMS ? client->extra.room.current_room : 0;
+  char list[MAX_SUBROOMS * (SUBROOM_NAME_LEN + 6) + 1];
+  int o = 0;
+  const char* t = rooms.welcome;
+  while (*t && o < max_len - 1) {
+    const char* rep = NULL;
+    int skip = 0;
+    if (strncmp(t, "{name}", 6) == 0) {
+      rep = _prefs.node_name; skip = 6;
+    } else if (strncmp(t, "{room}", 6) == 0) {
+      rep = rooms.names[cur]; skip = 6;
+    } else if (strncmp(t, "{rooms}", 7) == 0) {
+      formatRoomList(list, sizeof(list), -1); rep = list; skip = 7;
+    }
+    if (rep) {
+      while (*rep && o < max_len - 1) out[o++] = *rep++;
+      t += skip;
+    } else {
+      out[o++] = *t++;
+    }
+  }
+  out[o] = 0;
+}
+
+// message to one client, outside of the post sync (not ACK-tracked, server's sync_since untouched).
+// Sent as a 'signed' post by the server itself (like system posts), so apps show it in the room chat.
+// NOTE: the companion bumps its own 'sync since' to this timestamp - harmless, as the server keeps
+//       per-room sync state and only accepts 'force since' values that match a real post.
+void MyMesh::sendNotice(ClientInfo* client, const char* text) {
+  uint8_t temp[9 + MAX_POST_TEXT_LEN];
+  uint32_t now = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &now, 4);
+  uint8_t attempt;
+  getRNG()->random(&attempt, 1);
+  temp[4] = (TXT_TYPE_SIGNED_PLAIN << 2) | (attempt & 3);
+  memcpy(&temp[5], self_id.pub_key, 4);   // author prefix = this server
+
+  int text_len = strlen(text);
+  if (text_len > MAX_POST_TEXT_LEN) text_len = MAX_POST_TEXT_LEN;
+  memcpy(&temp[9], text, text_len);
+
+  auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, client->shared_secret, temp, 9 + text_len);
+  if (pkt) {
+    if (client->out_path_len == OUT_PATH_UNKNOWN) {
+      sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+    } else {
+      sendDirect(pkt, client->out_path, client->out_path_len);
+    }
+  }
+}
+
+// keep-alive 'force since' = newest post the companion has (from ANY sub-room), so only accept it
+// if it really is a post of the client's current sub-room
+void MyMesh::applyForceSince(ClientInfo* client, uint32_t force_since) {
+  uint8_t r = client->extra.room.current_room < MAX_SUBROOMS ? client->extra.room.current_room : 0;
+  if (force_since <= client->extra.room.sync_since[r]) return;
+  for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
+    if (posts[k].post_timestamp == force_since && (posts[k].room_id == r || posts[k].room_id == SUBROOM_ALL)) {
+      client->extra.room.sync_since[r] = force_since;
+      return;
+    }
+  }
+}
+
+void MyMesh::clearRoomPosts(int idx) {
+  for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
+    if (posts[k].room_id == idx) memset(&posts[k], 0, sizeof(posts[k]));   // timestamp 0 = never pushed
+  }
+}
+
+// If 'text' is a user command, returns pointer to the command word (after the slash), else NULL.
+// Skips leading whitespace and invisible chars some keyboards/apps insert (NBSP, zero-width, BOM),
+// accepts '/', JSON-escaped '\\/' and the fullwidth solidus U+FF0F.
+const char* MyMesh::findUserCommand(const char* text) {
+  const uint8_t* p = (const uint8_t*) text;
+  for (;;) {
+    if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') { p++; continue; }
+    if (p[0] == 0xC2 && p[1] == 0xA0) { p += 2; continue; }                                   // U+00A0 NBSP
+    if (p[0] == 0xE2 && p[1] == 0x80 && p[2] >= 0x8B && p[2] <= 0x8F) { p += 3; continue; }   // U+200B..U+200F
+    if (p[0] == 0xE2 && p[1] == 0x81 && p[2] == 0xA0) { p += 3; continue; }                   // U+2060 word joiner
+    if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) { p += 3; continue; }                   // U+FEFF BOM
+    break;
+  }
+  if (p[0] == '/') return (const char*) (p + 1);
+  if (p[0] == '\\' && p[1] == '/') return (const char*) (p + 2);                              // JSON-escaped "\/" (some clients)
+  if (p[0] == 0xEF && p[1] == 0xBC && p[2] == 0x8F) return (const char*) (p + 3);           // U+FF0F fullwidth '/'
+  return NULL;
+}
+
+// user commands, sent as normal chat messages starting with '/'  ('command' points AFTER the slash)
+void MyMesh::handleUserCommand(ClientInfo* client, const char* command, char* reply) {
+  char word[12];
+  const char* arg = nextToken(command, word, sizeof(word));
+  for (char* c = word; *c; c++) *c = tolower((unsigned char)*c);
+
+  uint8_t cur = client->extra.room.current_room < MAX_SUBROOMS ? client->extra.room.current_room : 0;
+
+  if (strcmp(word, "rooms") == 0 || strcmp(word, "r") == 0) {
+    int l = snprintf(reply, REPLY_MAX, "Rooms: ");
+    formatRoomList(&reply[l], REPLY_MAX - l, cur);
+  } else if (((strcmp(word, "join") == 0 || strcmp(word, "j") == 0) && *arg)
+             || strcmp(word, "exit") == 0 || strcmp(word, "leave") == 0) {   // /exit = back to the default room
+    int idx = (word[0] == 'j') ? findRoom(arg) : 0;
+    if (idx < 0) {
+      snprintf(reply, REPLY_MAX, SUBROOM_TXT_NOT_FOUND, arg);
+    } else if (idx == cur) {
+      snprintf(reply, REPLY_MAX, SUBROOM_TXT_ALREADY, rooms.names[idx]);
+    } else {
+      client->extra.room.current_room = idx;
+      client->extra.room.push_failures = 0;
+      next_push = futureMillis(PUSH_NOTIFY_DELAY_MILLIS);   // start syncing the new sub-room soon
+      snprintf(reply, REPLY_MAX, SUBROOM_TXT_JOINED, rooms.names[idx], (int)getUnsyncedCount(client));
+    }
+  } else if (strcmp(word, "where") == 0 || strcmp(word, "w") == 0) {
+    snprintf(reply, REPLY_MAX, SUBROOM_TXT_WHERE, rooms.names[cur]);
+  } else {
+    snprintf(reply, REPLY_MAX, "%s", SUBROOM_TXT_HELP);
+  }
+}
+
+// admin CLI: room.*   (returns false if not a sub-room command)
+bool MyMesh::handleRoomCommand(char* command, char* reply) {
+  const char* sub = &command[5];
+  char tok[SUBROOM_NAME_LEN+2];
+
+  if (strncmp(sub, "post", 4) == 0 && (sub[4] == 0 || sub[4] == ' ')) {   // room.post [@room] text
+    const char* msg = &sub[4];
+    while (*msg == ' ') msg++;
+    uint8_t target = SUBROOM_ALL;
+    if (*msg == '@') {
+      msg = nextToken(msg + 1, tok, sizeof(tok));
+      int idx = findRoom(tok);
+      if (idx < 0) { snprintf(reply, REPLY_MAX, "ERR unknown room"); return true; }
+      target = idx;
+    }
+    if (*msg == 0) {
+      snprintf(reply, REPLY_MAX, "ERR empty message");
+    } else {
+      addSystemPost(msg, target);
+      snprintf(reply, REPLY_MAX, "OK");
+    }
+  } else if (strcmp(sub, "list") == 0) {
+    int len = 0;
+    for (int i = 0; i < MAX_SUBROOMS && len < REPLY_MAX - 1; i++) {
+      if (!isRoomActive(i)) continue;
+      int n_posts = 0, n_clients = 0;
+      for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
+        if (posts[k].post_timestamp && posts[k].room_id == i) n_posts++;
+      }
+      for (int c = 0; c < acl.getNumClients(); c++) {
+        auto cl = acl.getClientByIdx(c);
+        if (cl->last_activity && cl->extra.room.current_room == i) n_clients++;
+      }
+      int n = snprintf(&reply[len], REPLY_MAX - len, "%s%d=%s p%d c%d", len ? ", " : "", i, rooms.names[i], n_posts, n_clients);
+      if (n < 0 || n >= REPLY_MAX - len) break;
+      len += n;
+    }
+    if (len < REPLY_MAX - 1) {
+      snprintf(&reply[len], REPLY_MAX - len, " | prefix %s, wake %s", (rooms.flags & SUBROOM_FLAG_PREFIX) ? "on" : "off",
+               (rooms.flags & SUBROOM_FLAG_DISP_WAKE) ? "on" : "off");
+    }
+  } else if (strcmp(sub, "last") == 0) {   // room.last  (diagnostics: newest post, first bytes in hex)
+    int best = -1;
+    for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
+      if (posts[k].post_timestamp && (best < 0 || posts[k].post_timestamp > posts[best].post_timestamp)) best = k;
+    }
+    if (best < 0) {
+      snprintf(reply, REPLY_MAX, "no posts");
+    } else {
+      auto p = &posts[best];
+      int len = snprintf(reply, REPLY_MAX, "r%d %02X%02X%02X%02X hex:", p->room_id == SUBROOM_ALL ? -1 : p->room_id,
+                         p->author.pub_key[0], p->author.pub_key[1], p->author.pub_key[2], p->author.pub_key[3]);
+      int tl = strlen(p->text);
+      for (int i = 0; i < tl && i < 12 && len < REPLY_MAX - 3; i++) {
+        len += snprintf(&reply[len], REPLY_MAX - len, "%02X", (uint8_t)p->text[i]);
+      }
+      snprintf(&reply[len], REPLY_MAX - len, " txt:%s", p->text);
+    }
+  } else if (strncmp(sub, "wake ", 5) == 0) {   // room.wake on|off  (display on new post)
+    if (strcmp(&sub[5], "on") == 0) {
+      rooms.flags |= SUBROOM_FLAG_DISP_WAKE;
+    } else if (strcmp(&sub[5], "off") == 0) {
+      rooms.flags &= ~SUBROOM_FLAG_DISP_WAKE;
+    } else {
+      snprintf(reply, REPLY_MAX, "ERR use: room.wake on|off");
+      return true;
+    }
+    saveRooms();
+    snprintf(reply, REPLY_MAX, "OK");
+  } else if (strncmp(sub, "add ", 4) == 0) {   // room.add <name>
+    nextToken(&sub[4], tok, sizeof(tok));
+    if (!isValidRoomName(tok)) {
+      snprintf(reply, REPLY_MAX, "ERR name: 1-%d chars, no spaces, not a single digit", SUBROOM_NAME_LEN);
+    } else if (findRoom(tok) >= 0) {
+      snprintf(reply, REPLY_MAX, "ERR room exists");
+    } else {
+      int slot = -1;
+      for (int i = 1; i < MAX_SUBROOMS; i++) {
+        if (rooms.names[i][0] == 0) { slot = i; break; }
+      }
+      if (slot < 0) {
+        snprintf(reply, REPLY_MAX, "ERR no free slot (max %d)", MAX_SUBROOMS - 1);
+      } else {
+        clearRoomPosts(slot);   // just in case
+        StrHelper::strncpy(rooms.names[slot], tok, sizeof(rooms.names[slot]));
+        saveRooms();
+        snprintf(reply, REPLY_MAX, "OK - room %d = %s", slot, rooms.names[slot]);
+      }
+    }
+  } else if (strncmp(sub, "del ", 4) == 0) {   // room.del <id|name>
+    int idx = findRoom(&sub[4]);
+    if (idx < 0) {
+      snprintf(reply, REPLY_MAX, "ERR unknown room");
+    } else if (idx == 0) {
+      snprintf(reply, REPLY_MAX, "ERR default room can't be deleted (use room.rename)");
+    } else {
+      clearRoomPosts(idx);
+      for (int c = 0; c < acl.getNumClients(); c++) {   // move its clients to the default room
+        auto cl = acl.getClientByIdx(c);
+        if (cl->extra.room.current_room == idx) {
+          cl->extra.room.current_room = 0;
+          cl->extra.room.flags |= ROOM_FLAG_NEED_WHERE;
+        }
+      }
+      rooms.names[idx][0] = 0;
+      saveRooms();
+      snprintf(reply, REPLY_MAX, "OK - room %d deleted", idx);
+    }
+  } else if (strncmp(sub, "rename ", 7) == 0) {   // room.rename <id|name> <new name>
+    const char* rest = nextToken(&sub[7], tok, sizeof(tok));
+    int idx = findRoom(tok);
+    char nm[SUBROOM_NAME_LEN+2];
+    nextToken(rest, nm, sizeof(nm));
+    if (idx < 0) {
+      snprintf(reply, REPLY_MAX, "ERR unknown room");
+    } else if (!isValidRoomName(nm)) {
+      snprintf(reply, REPLY_MAX, "ERR name: 1-%d chars, no spaces, not a single digit", SUBROOM_NAME_LEN);
+    } else if (findRoom(nm) >= 0 && findRoom(nm) != idx) {
+      snprintf(reply, REPLY_MAX, "ERR room exists");
+    } else {
+      StrHelper::strncpy(rooms.names[idx], nm, sizeof(rooms.names[idx]));
+      saveRooms();
+      snprintf(reply, REPLY_MAX, "OK - room %d = %s", idx, rooms.names[idx]);
+    }
+  } else if (strncmp(sub, "clear ", 6) == 0) {   // room.clear <id|name>
+    int idx = findRoom(&sub[6]);
+    if (idx < 0) {
+      snprintf(reply, REPLY_MAX, "ERR unknown room");
+    } else {
+      clearRoomPosts(idx);
+      snprintf(reply, REPLY_MAX, "OK - room %d cleared", idx);
+    }
+  } else if (strncmp(sub, "welcome", 7) == 0 && (sub[7] == 0 || sub[7] == ' ')) {   // room.welcome [text|default]
+    const char* txt = &sub[7];
+    while (*txt == ' ') txt++;
+    if (*txt == 0) {
+      snprintf(reply, REPLY_MAX, "%s", rooms.welcome);   // show current
+    } else {
+      if (strcmp(txt, "default") == 0) txt = SUBROOM_DEFAULT_WELCOME;
+      bool too_long = strlen(txt) > SUBROOM_WELCOME_LEN;
+      StrHelper::strncpy(rooms.welcome, txt, sizeof(rooms.welcome));
+      saveRooms();
+      snprintf(reply, REPLY_MAX, too_long ? "OK (truncated to %d chars)" : "OK", SUBROOM_WELCOME_LEN);
+    }
+  } else if (strncmp(sub, "prefix ", 7) == 0) {   // room.prefix on|off
+    if (strcmp(&sub[7], "on") == 0) {
+      rooms.flags |= SUBROOM_FLAG_PREFIX;
+    } else if (strcmp(&sub[7], "off") == 0) {
+      rooms.flags &= ~SUBROOM_FLAG_PREFIX;
+    } else {
+      snprintf(reply, REPLY_MAX, "ERR use: room.prefix on|off");
+      return true;
+    }
+    saveRooms();
+    snprintf(reply, REPLY_MAX, "OK");
+  } else {
+    return false;   // not ours
+  }
+  return true;
+}
+
+/* ------------------------------ UI stats ------------------------------ */
+
+void MyMesh::getRoomStats(int idx, SubRoomStats& out) {
+  out.active = isRoomActive(idx);
+  out.name = (idx >= 0 && idx < MAX_SUBROOMS) ? rooms.names[idx] : "";
+  out.posts = 0;
+  out.clients = 0;
+  out.last_post = 0;
+  if (!out.active) return;
+
+  for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
+    auto p = &posts[k];
+    if (p->post_timestamp && (p->room_id == idx || p->room_id == SUBROOM_ALL)) {
+      out.posts++;
+      if (p->post_timestamp > out.last_post) out.last_post = p->post_timestamp;
+    }
+  }
+  uint32_t now = getRTCClock()->getCurrentTime();
+  for (int c = 0; c < acl.getNumClients(); c++) {
+    auto cl = acl.getClientByIdx(c);
+    if (cl->last_activity && now - cl->last_activity < ROOM_ONLINE_SECS && cl->extra.room.current_room == idx) {
+      out.clients++;
+    }
+  }
+}
+
+int MyMesh::getNumBufferedPosts() const {
+  int n = 0;
+  for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
+    if (posts[k].post_timestamp) n++;
+  }
+  return n;
+}
+
+int MyMesh::getNumOnlineClients() {
+  int n = 0;
+  uint32_t now = getRTCClock()->getCurrentTime();
+  for (int c = 0; c < acl.getNumClients(); c++) {
+    auto cl = acl.getClientByIdx(c);
+    if (cl->last_activity && now - cl->last_activity < ROOM_ONLINE_SECS) n++;
+  }
+  return n;
 }

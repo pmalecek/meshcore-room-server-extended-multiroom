@@ -66,8 +66,38 @@
 #endif
 
 #ifndef MAX_UNSYNCED_POSTS
-  #define MAX_UNSYNCED_POSTS    32
+  #define MAX_UNSYNCED_POSTS    64
 #endif
+
+/* ------------------------------ Sub-rooms ------------------------------ */
+
+#define SUBROOM_NAME_LEN       15
+#define SUBROOM_WELCOME_LEN    140
+#define SUBROOM_ALL            0xFF      // post_room for system posts sent to every sub-room
+#define SUBROOM_FLAG_PREFIX    0x01      // prefix pushed posts with "[room] "
+#define SUBROOM_FLAG_DISP_WAKE 0x02      // turn the display on when a new post arrives
+#define ROOM_ONLINE_SECS       3600      // client counts as 'online' if active within this time
+#define SUBROOMS_FILE          "/s_rooms"
+
+#ifndef SUBROOM_DEFAULT_NAME
+  #define SUBROOM_DEFAULT_NAME   "Lobby"
+#endif
+#ifndef SUBROOM_DEFAULT_WELCOME
+  #define SUBROOM_DEFAULT_WELCOME  "Vitej na {name}! Jsi v {room}. Rooms: {rooms}. Prepni: /join <cislo>, /help"
+#endif
+
+// texts sent to users (no diacritics on purpose: some device displays lack the glyphs)
+#define SUBROOM_TXT_HELP       "Prikazy: /rooms, /join <cislo|nazev>, /exit (zpet do lobby), /where, /help"
+#define SUBROOM_TXT_WHERE      "Jsi v room %s"
+#define SUBROOM_TXT_JOINED     "Jsi v room %s (%d novych zprav)"
+#define SUBROOM_TXT_ALREADY    "Uz jsi v room %s"
+#define SUBROOM_TXT_NOT_FOUND  "Room '%s' neexistuje. Seznam: /rooms"
+
+struct SubRoomConfig {
+  char names[MAX_SUBROOMS][SUBROOM_NAME_LEN+1];   // empty name = unused slot (slot 0 always used)
+  char welcome[SUBROOM_WELCOME_LEN+1];            // template: {name} {room} {rooms}
+  uint8_t flags;                                  // SUBROOM_FLAG_*
+};
 
 #ifndef SERVER_RESPONSE_DELAY
   #define SERVER_RESPONSE_DELAY   300
@@ -86,7 +116,16 @@
 struct PostInfo {
   mesh::Identity author;
   uint32_t post_timestamp;   // by OUR clock
+  uint8_t  room_id;          // sub-room index, or SUBROOM_ALL
   char text[MAX_POST_TEXT_LEN+1];
+};
+
+struct SubRoomStats {
+  bool active;
+  const char* name;
+  int posts;           // posts in buffer
+  int clients;         // online clients currently in this room
+  uint32_t last_post;  // timestamp of newest post (0 = none)
 };
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
@@ -119,10 +158,28 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
 
+  SubRoomConfig rooms;
+
   void addPost(ClientInfo* client, const char* postData);
-  void storePost(const mesh::Identity& author, const char* postData);
+  void storePost(const mesh::Identity& author, const char* postData, uint8_t room_id);
   void pushPostToClient(ClientInfo* client, PostInfo& post);
   uint8_t getUnsyncedCount(ClientInfo* client);
+  bool isPostForClient(const PostInfo& post, const ClientInfo* client) const;
+
+  // sub-rooms
+  void loadRooms();
+  void saveRooms();
+  bool isRoomActive(int idx) const { return idx == 0 || (idx > 0 && idx < MAX_SUBROOMS && rooms.names[idx][0] != 0); }
+  bool hasOptionalRooms() const;
+  int  findRoom(const char* key) const;
+  int  formatRoomList(char* out, int max_len, int mark_room) const;
+  void expandWelcome(const ClientInfo* client, char* out, int max_len) const;
+  void sendNotice(ClientInfo* client, const char* text);
+  static const char* findUserCommand(const char* text);
+  void handleUserCommand(ClientInfo* client, const char* command, char* reply);
+  bool handleRoomCommand(char* command, char* reply);
+  void clearRoomPosts(int idx);
+  void applyForceSince(ClientInfo* client, uint32_t force_since);
   bool processAck(const uint8_t *data);
   mesh::Packet* createSelfAdvert();
   File openAppend(const char* fname);
@@ -178,7 +235,15 @@ public:
   MyMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
   void begin(FILESYSTEM* fs);
-  void addSystemPost(const char* postData);
+  void addSystemPost(const char* postData, uint8_t room_id = SUBROOM_ALL);
+
+  // for UI / display
+  void getRoomStats(int idx, SubRoomStats& out);
+  int  getNumBufferedPosts() const;
+  int  getNumOnlineClients();
+  uint16_t getNumPosted() const { return _num_posted; }
+  uint32_t getCurrentTime() { return getRTCClock()->getCurrentTime(); }
+  bool isDisplayWakeOn() const { return (rooms.flags & SUBROOM_FLAG_DISP_WAKE) != 0; }
 
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }

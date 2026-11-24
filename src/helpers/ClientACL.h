@@ -12,6 +12,14 @@
 
 #define OUT_PATH_UNKNOWN  0xFF
 
+#ifndef MAX_SUBROOMS
+  #define MAX_SUBROOMS   4    // room server: sub-room 0 = default, 1..3 optional
+#endif
+
+// room server: extra.room.flags
+#define ROOM_FLAG_NEED_WELCOME   0x01   // send welcome notice (new client)
+#define ROOM_FLAG_NEED_WHERE     0x02   // send 'you are in room X' notice
+
 struct ClientInfo {
   mesh::Identity id;
   uint8_t permissions;
@@ -22,11 +30,16 @@ struct ClientInfo {
   uint32_t last_activity;    // by OUR clock    (transient)
   union  {
     struct {
-      uint32_t sync_since;  // sync messages SINCE this timestamp (by OUR clock)
+      // sync messages SINCE this timestamp (by OUR clock), one per sub-room.
+      // NOTE: sync_since[0] stays at offset 0 (same bytes as legacy 'sync_since', persisted by load()/save())
+      uint32_t sync_since[MAX_SUBROOMS];
       uint32_t pending_ack;
       uint32_t push_post_timestamp;
       unsigned long ack_timeout;
       uint8_t  push_failures;
+      uint8_t  current_room;   // sub-room the client is currently in
+      uint8_t  push_room;      // sub-room of the post awaiting ACK
+      uint8_t  flags;          // ROOM_FLAG_*
     } room;
     struct {
       uint32_t expiry_timestamp;  // epoch seconds
